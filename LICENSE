@@ -1,0 +1,57 @@
+PURE-NATIVE NON-COMMERCIAL COPYLEFT LICENSE (PNNCL v1.0)
+========================================================
+
+Copyright (c) 2026 DmytroHardcoder
+All rights reserved except as explicitly granted below.
+
+This License governs the use, modification, and distribution of this software
+and its source code ("the Software"). By using, copying, or modifying the
+Software, you agree to be bound by all terms below.
+
+1. FREEDOM TO USE AND MODIFY
+Subject to the restrictions set forth in Sections 2 through 5 of this License,
+any individual or non-commercial community is granted a royalty-free, perpetual,
+worldwide right to use, study, modify, port, and redistribute the Software.
+
+2. MANDATORY OPEN SOURCE (STRICT COPYLEFT)
+Any modifications, forks, derivative works, or compiled binaries (including APK
+packages and flashable archives) based in whole or in part on the Software MUST
+be distributed with complete, corresponding, human-readable source code under
+the exact same terms of this License (PNNCL v1.0). Closing the source code,
+obfuscation, or binary-only distribution is strictly prohibited.
+
+3. STRICT NON-COMMERCIAL RESTRICTION
+You may NOT use the Software or any derivative works for any commercial purpose,
+including but not limited to:
+- selling the Software or charging for access to it (standalone or bundled
+  within paid ROMs, modules, or services);
+- integrating any advertising SDKs, analytics, telemetry, user tracking, or
+  monetization mechanisms;
+- use of the Software by for-profit corporations in internal or external
+  products.
+
+4. TECHNICAL PURITY & PROHIBITION OF PROPRIETARY BLOATWARE
+To preserve zero-overhead execution, derivative works and forks are strictly
+prohibited from linking, importing, or bundling:
+- Android Jetpack, AndroidX, AppCompat, Google Material Components, Google Play
+  Services (GMS), or Kotlin standard libraries;
+- cross-platform frameworks or web wrappers (React Native, Flutter, WebView,
+  JS runtimes, etc.);
+- proprietary binary blobs, closed-source SDKs, or third-party prebuilt
+  archives (.jar, .aar, .so).
+All derivative code must rely solely on the bare native platform SDK.
+
+5. CORPORATE EXCLUSION (CUPERTINO / APPLE INC. BAN)
+Apple Inc. (Cupertino, California, USA), including all of its subsidiaries,
+affiliates, employees, contractors, legal representatives, and automated data
+scrapers or AI training pipelines, is EXPRESSLY PROHIBITED from accessing,
+downloading, copying, inspecting, executing, training on, or otherwise using
+the Software or its source code in any form. Zero rights are granted to the
+aforementioned entities under this License.
+
+6. AUTOMATIC TERMINATION & NO WARRANTY
+Any breach of Sections 2, 3, 4, or 5 automatically and immediately terminates
+all rights granted to you under this License.
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY CLAIM, DAMAGES, OR
+HARDWARE FAILURE ARISING FROM THE USE OF THE SOFTWARE.
