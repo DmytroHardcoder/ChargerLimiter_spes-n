@@ -1,0 +1,1925 @@
+### `SysfsController.java`
+
+```java
+package com.spes.chargelimiter;
+
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.util.Locale;
+
+public final class SysfsController {
+
+    public static final class NodeSpec {
+        public final String path;
+        public final String enableValue;
+        public final String disableValue;
+
+        public NodeSpec(String path, String enableValue, String disableValue) {
+            this.path = path;
+            this.enableValue = enableValue;
+            this.disableValue = disableValue;
+        }
+    }
+
+    // [ENABLE_VALUE, DISABLE_VALUE]
+    private static final NodeSpec[] PRIORITY_NODES = new NodeSpec[] {
+        new NodeSpec("/sys/class/power_supply/battery/input_suspend", "0", "1"),
+        new NodeSpec("/sys/class/qcom-battery/input_suspend", "0", "1"),
+        new NodeSpec("/sys/class/power_supply/battery/charging_enabled", "1", "0"),
+        new NodeSpec("/sys/class/power_supply/battery/batt_slate_mode", "0", "1"),
+        new NodeSpec("/sys/class/power_supply/usb/input_suspend", "0", "1")
+    };
+
+    private static final NodeSpec[] FALLBACK_NODES = new NodeSpec[] {
+        new NodeSpec("/sys/class/power_supply/battery/battery_charging_enabled", "1", "0"),
+        new NodeSpec("/sys/class/power_supply/battery/charge_disable", "0", "1"),
+        new NodeSpec("/sys/class/power_supply/battery/stop_charging", "0", "1"),
+        new NodeSpec("/sys/class/power_supply/battery/store_mode", "0", "1"),
+        new NodeSpec("/sys/class/power_supply/main/input_suspend", "0", "1")
+    };
+
+    private static final String USB_PRESENT_PATH = "/sys/class/power_supply/usb/present";
+    private static final String USB_ONLINE_PATH = "/sys/class/power_supply/usb/online";
+    private static final String TYPEC_MODE_PATH = "/sys/class/power_supply/usb/typec_mode";
+
+    private static NodeSpec sActiveNode = null;
+
+    private SysfsController() {}
+
+    public static synchronized NodeSpec resolveNode() {
+        if (sActiveNode != null) {
+            File f = new File(sActiveNode.path);
+            if (f.exists() && f.canWrite()) {
+                return sActiveNode;
+            }
+            sActiveNode = null;
+        }
+
+        for (int i = 0; i < PRIORITY_NODES.length; i++) {
+            NodeSpec spec = PRIORITY_NODES[i];
+            File file = new File(spec.path);
+            if (file.exists() && file.canWrite()) {
+                sActiveNode = spec;
+                return sActiveNode;
+            }
+        }
+
+        for (int i = 0; i < FALLBACK_NODES.length; i++) {
+            NodeSpec spec = FALLBACK_NODES[i];
+            File file = new File(spec.path);
+            if (file.exists() && file.canWrite()) {
+                sActiveNode = spec;
+                return sActiveNode;
+            }
+        }
+
+        return null;
+    }
+
+    public static synchronized boolean isAvailable() {
+        return resolveNode() != null;
+    }
+
+    public static synchronized boolean setChargingEnabled(boolean enable) {
+        NodeSpec node = resolveNode();
+        if (node == null) {
+            return false;
+        }
+        String targetVal = enable ? node.enableValue : node.disableValue;
+        String currentVal = readNodeValue(node.path);
+        if (targetVal.equals(currentVal)) {
+            return true;
+        }
+        return writeNodeValue(node.path, targetVal);
+    }
+
+    public static synchronized boolean forceSetChargingEnabled(boolean enable) {
+        NodeSpec node = resolveNode();
+        if (node == null) {
+            return false;
+        }
+        String targetVal = enable ? node.enableValue : node.disableValue;
+        return writeNodeValue(node.path, targetVal);
+    }
+
+    public static synchronized boolean isChargingSuspended() {
+        NodeSpec node = resolveNode();
+        if (node == null) {
+            return false;
+        }
+        String val = readNodeValue(node.path);
+        if (val == null) {
+            return false;
+        }
+        return node.disableValue.equals(val);
+    }
+
+    public static synchronized boolean isCablePhysicallyConnected(boolean extraPlugged) {
+        if (extraPlugged) {
+            return true;
+        }
+        if (!isChargingSuspended()) {
+            return false;
+        }
+        String usbPresent = readNodeValue(USB_PRESENT_PATH);
+        if ("1".equals(usbPresent)) {
+            return true;
+        }
+        String typecMode = readNodeValue(TYPEC_MODE_PATH);
+        if (typecMode != null && !typecMode.isEmpty()) {
+            if (typecMode.toLowerCase(Locale.US).contains("nothing")) {
+                return false;
+            }
+            return true;
+        }
+        if ("0".equals(usbPresent)) {
+            return false;
+        }
+        return true;
+    }
+
+    private static boolean writeNodeValue(String path, String value) {
+        FileOutputStream fos = null;
+        try {
+            fos = new FileOutputStream(path, false);
+            byte[] bytes = value.getBytes(StandardCharsets.US_ASCII);
+            fos.write(bytes);
+            fos.flush();
+            return true;
+        } catch (IOException e) {
+            return false;
+        } finally {
+            if (fos != null) {
+                try {
+                    fos.close();
+                } catch (IOException ignored) {}
+            }
+        }
+    }
+
+    private static String readNodeValue(String path) {
+        FileInputStream fis = null;
+        try {
+            File file = new File(path);
+            if (!file.exists() || !file.canRead()) {
+                return null;
+            }
+            fis = new FileInputStream(file);
+            byte[] buffer = new byte[64];
+            int read = fis.read(buffer);
+            if (read <= 0) {
+                return null;
+            }
+            return new String(buffer, 0, read, StandardCharsets.US_ASCII).trim();
+        } catch (IOException e) {
+            return null;
+        } finally {
+            if (fis != null) {
+                try {
+                    fis.close();
+                } catch (IOException ignored) {}
+            }
+        }
+    }
+}
+```
+
+### `ChargeMonitorService.java`
+
+```java
+package com.spes.chargelimiter;
+
+import android.app.Service;
+import android.content.BroadcastReceiver;
+import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
+import android.content.SharedPreferences;
+import android.os.BatteryManager;
+import android.os.Handler;
+import android.os.IBinder;
+import android.os.Looper;
+import android.os.PowerManager;
+import android.os.Process;
+
+public final class ChargeMonitorService extends Service {
+
+    private static final long POLL_INTERVAL_MS = 3000L;
+
+    private static final String ACTION_CABLE_CONNECTED = "com.spes.chargelimiter.ACTION_CABLE_CONNECTED";
+    private static final String ACTION_CABLE_DISCONNECTED = "com.spes.chargelimiter.ACTION_CABLE_DISCONNECTED";
+    private static final String ACTION_RELOAD_UNPLUG_POLICY = "com.spes.chargelimiter.ACTION_RELOAD_UNPLUG_POLICY";
+
+    private static ChargeMonitorService sInstance = null;
+
+    private final Handler mHandler = new Handler(Looper.getMainLooper());
+    private boolean mPollingActive = false;
+    private boolean mUnplugTimerRunning = false;
+    private boolean mUnplugTimerElapsed = false;
+    private boolean mScreenReceiverRegistered = false;
+
+    private final Runnable mPollRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (!mPollingActive) {
+                return;
+            }
+            boolean stillConnected = ChargeReceiver.evaluateAndCheckConnected(ChargeMonitorService.this, false);
+            if (stillConnected && mPollingActive) {
+                mHandler.postDelayed(this, POLL_INTERVAL_MS);
+            }
+        }
+    };
+
+    private final Runnable mKillTimerRunnable = new Runnable() {
+        @Override
+        public void run() {
+            mUnplugTimerRunning = false;
+            mUnplugTimerElapsed = true;
+            evaluateKillConditions();
+        }
+    };
+
+    private final BroadcastReceiver mScreenStateReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            if (intent == null) {
+                return;
+            }
+            String action = intent.getAction();
+            if (Intent.ACTION_SCREEN_OFF.equals(action) || Intent.ACTION_SCREEN_ON.equals(action)) {
+                evaluateKillConditions();
+            }
+        }
+    };
+
+    public static void notifyCableConnected(Context context) {
+        ChargeMonitorService inst = sInstance;
+        if (inst != null) {
+            inst.handleCableConnectedInternal();
+            return;
+        }
+        Context appCtx = context.getApplicationContext();
+        if (appCtx == null) {
+            appCtx = context;
+        }
+        try {
+            Intent intent = new Intent(appCtx, ChargeMonitorService.class);
+            intent.setAction(ACTION_CABLE_CONNECTED);
+            appCtx.startService(intent);
+        } catch (Throwable ignored) {}
+    }
+
+    public static void notifyCableDisconnected(Context context) {
+        Context appCtx = context.getApplicationContext();
+        if (appCtx == null) {
+            appCtx = context;
+        }
+        SharedPreferences prefs = ChargeReceiver.getPrefs(appCtx);
+        int mode = prefs.getInt(ChargeReceiver.KEY_UNPLUG_MODE, ChargeReceiver.MODE_KILL_TIMER_ANY);
+
+        if (mode == ChargeReceiver.MODE_STAY_ALIVE_IDLE) {
+            ChargeMonitorService inst = sInstance;
+            if (inst != null) {
+                inst.cleanupAllAndStopSelf();
+            }
+            return;
+        }
+
+        if (mode == ChargeReceiver.MODE_KILL_SCREEN_OFF_IMMEDIATE) {
+            if (!isScreenInteractive(appCtx) && !MainActivity.isUiVisible()) {
+                ChargeMonitorService inst = sInstance;
+                if (inst != null) {
+                    inst.cleanupAllAndStopSelf();
+                }
+                killProcessNow();
+                return;
+            }
+        }
+
+        ChargeMonitorService inst = sInstance;
+        if (inst != null) {
+            inst.handleCableDisconnectedInternal(false);
+            return;
+        }
+        try {
+            Intent intent = new Intent(appCtx, ChargeMonitorService.class);
+            intent.setAction(ACTION_CABLE_DISCONNECTED);
+            appCtx.startService(intent);
+        } catch (Throwable ignored) {}
+    }
+
+    public static void notifyPolicyChangedOrUiClosed(Context context, boolean resetTimer) {
+        Context appCtx = context.getApplicationContext();
+        if (appCtx == null) {
+            appCtx = context;
+        }
+        if (isCableCurrentlyConnected(appCtx)) {
+            notifyCableConnected(appCtx);
+            return;
+        }
+        SysfsController.forceSetChargingEnabled(true);
+        ChargeReceiver.unregisterDynamicReceiver(appCtx);
+        ChargeTriggerJobService.scheduleChargingWakeup(appCtx);
+
+        SharedPreferences prefs = ChargeReceiver.getPrefs(appCtx);
+        int mode = prefs.getInt(ChargeReceiver.KEY_UNPLUG_MODE, ChargeReceiver.MODE_KILL_TIMER_ANY);
+
+        if (mode == ChargeReceiver.MODE_STAY_ALIVE_IDLE) {
+            ChargeMonitorService inst = sInstance;
+            if (inst != null) {
+                inst.cleanupAllAndStopSelf();
+            }
+            return;
+        }
+
+        if (mode == ChargeReceiver.MODE_KILL_SCREEN_OFF_IMMEDIATE) {
+            if (!isScreenInteractive(appCtx) && !MainActivity.isUiVisible()) {
+                ChargeMonitorService inst = sInstance;
+                if (inst != null) {
+                    inst.cleanupAllAndStopSelf();
+                }
+                killProcessNow();
+                return;
+            }
+        }
+
+        ChargeMonitorService inst = sInstance;
+        if (inst != null) {
+            inst.handleCableDisconnectedInternal(resetTimer);
+            return;
+        }
+        try {
+            Intent intent = new Intent(appCtx, ChargeMonitorService.class);
+            intent.setAction(resetTimer ? ACTION_RELOAD_UNPLUG_POLICY : ACTION_CABLE_DISCONNECTED);
+            appCtx.startService(intent);
+        } catch (Throwable ignored) {}
+    }
+
+    @Override
+    public void onCreate() {
+        super.onCreate();
+        sInstance = this;
+    }
+
+    @Override
+    public int onStartCommand(Intent intent, int flags, int startId) {
+        sInstance = this;
+        String action = intent != null ? intent.getAction() : null;
+        if (ACTION_CABLE_CONNECTED.equals(action)) {
+            handleCableConnectedInternal();
+        } else if (ACTION_CABLE_DISCONNECTED.equals(action)) {
+            handleCableDisconnectedInternal(false);
+        } else if (ACTION_RELOAD_UNPLUG_POLICY.equals(action)) {
+            handleCableDisconnectedInternal(true);
+        } else {
+            if (isCableCurrentlyConnected(this)) {
+                handleCableConnectedInternal();
+            } else {
+                handleCableDisconnectedInternal(false);
+            }
+        }
+        return START_STICKY;
+    }
+
+    private void handleCableConnectedInternal() {
+        cancelUnplugTimersAndReceivers();
+        ChargeReceiver.registerDynamicReceiver(this);
+        startPolling();
+    }
+
+    private void handleCableDisconnectedInternal(boolean forceResetTimer) {
+        stopPolling();
+        SysfsController.forceSetChargingEnabled(true);
+        ChargeReceiver.unregisterDynamicReceiver(this);
+        ChargeTriggerJobService.scheduleChargingWakeup(this);
+
+        SharedPreferences prefs = ChargeReceiver.getPrefs(this);
+        int mode = prefs.getInt(ChargeReceiver.KEY_UNPLUG_MODE, ChargeReceiver.MODE_KILL_TIMER_ANY);
+
+        if (mode == ChargeReceiver.MODE_STAY_ALIVE_IDLE) {
+            cleanupAllAndStopSelf();
+            return;
+        }
+
+        if (mode == ChargeReceiver.MODE_KILL_SCREEN_OFF_IMMEDIATE) {
+            mHandler.removeCallbacks(mKillTimerRunnable);
+            mUnplugTimerRunning = false;
+            mUnplugTimerElapsed = false;
+            registerScreenReceiverIfNeeded();
+            evaluateKillConditions();
+            return;
+        }
+
+        if (mode == ChargeReceiver.MODE_KILL_TIMER_ANY) {
+            unregisterScreenReceiverIfNeeded();
+            if (forceResetTimer || (!mUnplugTimerRunning && !mUnplugTimerElapsed)) {
+                startUnplugTimer(prefs);
+            } else {
+                evaluateKillConditions();
+            }
+            return;
+        }
+
+        if (mode == ChargeReceiver.MODE_KILL_SCREEN_OFF_TIMER) {
+            registerScreenReceiverIfNeeded();
+            if (forceResetTimer || (!mUnplugTimerRunning && !mUnplugTimerElapsed)) {
+                startUnplugTimer(prefs);
+            } else {
+                evaluateKillConditions();
+            }
+        }
+    }
+
+    private void startUnplugTimer(SharedPreferences prefs) {
+        int hours = prefs.getInt(ChargeReceiver.KEY_KILL_HOURS, ChargeReceiver.DEFAULT_KILL_HOURS);
+        int minutes = prefs.getInt(ChargeReceiver.KEY_KILL_MINUTES, ChargeReceiver.DEFAULT_KILL_MINUTES);
+        if (hours < 0) hours = 0;
+        if (minutes < 0) minutes = 0;
+        if (hours == 0 && minutes == 0) {
+            minutes = 1;
+        }
+        long delayMs = ((long) hours * 3600L + (long) minutes * 60L) * 1000L;
+        mHandler.removeCallbacks(mKillTimerRunnable);
+        mUnplugTimerElapsed = false;
+        mUnplugTimerRunning = true;
+        mHandler.postDelayed(mKillTimerRunnable, delayMs);
+    }
+
+    private void evaluateKillConditions() {
+        if (isCableCurrentlyConnected(this)) {
+            handleCableConnectedInternal();
+            return;
+        }
+
+        SharedPreferences prefs = ChargeReceiver.getPrefs(this);
+        int mode = prefs.getInt(ChargeReceiver.KEY_UNPLUG_MODE, ChargeReceiver.MODE_KILL_TIMER_ANY);
+
+        if (mode == ChargeReceiver.MODE_STAY_ALIVE_IDLE) {
+            cleanupAllAndStopSelf();
+            return;
+        }
+
+        if (mode == ChargeReceiver.MODE_KILL_TIMER_ANY) {
+            if (mUnplugTimerElapsed && !MainActivity.isUiVisible()) {
+                cleanupAllAndStopSelf();
+                killProcessNow();
+            }
+            return;
+        }
+
+        if (mode == ChargeReceiver.MODE_KILL_SCREEN_OFF_TIMER) {
+            if (mUnplugTimerElapsed && !isScreenInteractive(this) && !MainActivity.isUiVisible()) {
+                cleanupAllAndStopSelf();
+                killProcessNow();
+            }
+            return;
+        }
+
+        if (mode == ChargeReceiver.MODE_KILL_SCREEN_OFF_IMMEDIATE) {
+            if (!isScreenInteractive(this) && !MainActivity.isUiVisible()) {
+                cleanupAllAndStopSelf();
+                killProcessNow();
+            }
+        }
+    }
+
+    private void startPolling() {
+        if (!mPollingActive) {
+            mPollingActive = true;
+            mHandler.removeCallbacks(mPollRunnable);
+            mHandler.postDelayed(mPollRunnable, POLL_INTERVAL_MS);
+        }
+    }
+
+    private void stopPolling() {
+        mPollingActive = false;
+        mHandler.removeCallbacks(mPollRunnable);
+    }
+
+    private void registerScreenReceiverIfNeeded() {
+        if (!mScreenReceiverRegistered) {
+            IntentFilter filter = new IntentFilter();
+            filter.addAction(Intent.ACTION_SCREEN_OFF);
+            filter.addAction(Intent.ACTION_SCREEN_ON);
+            registerReceiver(mScreenStateReceiver, filter);
+            mScreenReceiverRegistered = true;
+        }
+    }
+
+    private void unregisterScreenReceiverIfNeeded() {
+        if (mScreenReceiverRegistered) {
+            try {
+                unregisterReceiver(mScreenStateReceiver);
+            } catch (IllegalArgumentException ignored) {}
+            mScreenReceiverRegistered = false;
+        }
+    }
+
+    private void cancelUnplugTimersAndReceivers() {
+        mHandler.removeCallbacks(mKillTimerRunnable);
+        mUnplugTimerRunning = false;
+        mUnplugTimerElapsed = false;
+        unregisterScreenReceiverIfNeeded();
+    }
+
+    private void cleanupAllAndStopSelf() {
+        stopPolling();
+        cancelUnplugTimersAndReceivers();
+        stopSelf();
+    }
+
+    private static boolean isCableCurrentlyConnected(Context context) {
+        Intent sticky = context.registerReceiver(null, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+        boolean extraPlugged = false;
+        if (sticky != null) {
+            extraPlugged = sticky.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) != 0;
+        }
+        return SysfsController.isCablePhysicallyConnected(extraPlugged);
+    }
+
+    private static boolean isScreenInteractive(Context context) {
+        PowerManager pm = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
+        return pm != null && pm.isInteractive();
+    }
+
+    private static void killProcessNow() {
+        Process.killProcess(Process.myPid());
+        System.exit(0);
+    }
+
+    @Override
+    public void onDestroy() {
+        stopPolling();
+        cancelUnplugTimersAndReceivers();
+        if (sInstance == this) {
+            sInstance = null;
+        }
+        super.onDestroy();
+    }
+
+    @Override
+    public IBinder onBind(Intent intent) {
+        return null;
+    }
+}
+```
+
+### `ChargeTriggerJobService.java`
+
+```java
+package com.spes.chargelimiter;
+
+import android.app.job.JobInfo;
+import android.app.job.JobParameters;
+import android.app.job.JobScheduler;
+import android.app.job.JobService;
+import android.content.ComponentName;
+import android.content.Context;
+
+public final class ChargeTriggerJobService extends JobService {
+
+    private static final int JOB_ID = 1001;
+
+    public static void scheduleChargingWakeup(Context context) {
+        Context appCtx = context.getApplicationContext();
+        if (appCtx == null) {
+            appCtx = context;
+        }
+        JobScheduler scheduler = (JobScheduler) appCtx.getSystemService(Context.JOB_SCHEDULER_SERVICE);
+        if (scheduler == null) {
+            return;
+        }
+        ComponentName component = new ComponentName(appCtx, ChargeTriggerJobService.class);
+        JobInfo jobInfo = new JobInfo.Builder(JOB_ID, component)
+                .setRequiresCharging(true)
+                .setPersisted(true)
+                .build();
+        scheduler.schedule(jobInfo);
+    }
+
+    @Override
+    public boolean onStartJob(JobParameters params) {
+        ChargeReceiver.evaluateImmediate(this);
+        return false;
+    }
+
+    @Override
+    public boolean onStopJob(JobParameters params) {
+        return true;
+    }
+}
+```
+
+### `ChargeReceiver.java`
+
+```java
+package com.spes.chargelimiter;
+
+import android.content.BroadcastReceiver;
+import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
+import android.content.SharedPreferences;
+import android.os.BatteryManager;
+
+public final class ChargeReceiver extends BroadcastReceiver {
+
+    public static final String PREFS_NAME = "charge_limiter_prefs";
+    public static final String KEY_ENABLED = "limit_enabled";
+    public static final String KEY_LIMIT = "limit_pct";
+    public static final String KEY_DELTA = "limit_delta";
+    public static final String KEY_THEME = "ui_theme";
+    public static final String KEY_LANG = "ui_lang";
+    public static final String KEY_UNPLUG_MODE = "unplug_mode";
+    public static final String KEY_KILL_HOURS = "kill_hours";
+    public static final String KEY_KILL_MINUTES = "kill_minutes";
+
+    public static final int DEFAULT_LIMIT = 80;
+    public static final int MIN_LIMIT = 50;
+    public static final int MAX_LIMIT = 100;
+
+    public static final int DEFAULT_DELTA = 10;
+    public static final int MIN_DELTA = 1;
+    public static final int MAX_DELTA = 15;
+
+    public static final int MIN_RESUME_THRESHOLD = 40;
+
+    public static final int MODE_KILL_TIMER_ANY = 0;
+    public static final int MODE_KILL_SCREEN_OFF_TIMER = 1;
+    public static final int MODE_KILL_SCREEN_OFF_IMMEDIATE = 2;
+    public static final int MODE_STAY_ALIVE_IDLE = 3;
+
+    public static final int DEFAULT_KILL_HOURS = 0;
+    public static final int DEFAULT_KILL_MINUTES = 5;
+
+    public interface StateListener {
+        void onBatteryStateUpdated(int level, boolean plugged, boolean charging, boolean suspended);
+    }
+
+    private static ChargeReceiver sDynamicReceiver = null;
+    private static StateListener sListener = null;
+
+    public static void setStateListener(StateListener listener) {
+        sListener = listener;
+    }
+
+    public static SharedPreferences getPrefs(Context context) {
+        Context storageCtx = context.createDeviceProtectedStorageContext();
+        return storageCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+    }
+
+    public static int computeResumeThreshold(int limit, int delta) {
+        int resume = limit - delta;
+        return resume < MIN_RESUME_THRESHOLD ? MIN_RESUME_THRESHOLD : resume;
+    }
+
+    public static synchronized void registerDynamicReceiver(Context context) {
+        Context appContext = context.getApplicationContext();
+        if (appContext == null) {
+            appContext = context;
+        }
+        if (sDynamicReceiver == null) {
+            sDynamicReceiver = new ChargeReceiver();
+            IntentFilter filter = new IntentFilter();
+            filter.addAction(Intent.ACTION_BATTERY_CHANGED);
+            filter.addAction(Intent.ACTION_POWER_CONNECTED);
+            filter.addAction(Intent.ACTION_POWER_DISCONNECTED);
+            appContext.registerReceiver(sDynamicReceiver, filter);
+        }
+    }
+
+    public static synchronized void unregisterDynamicReceiver(Context context) {
+        if (sDynamicReceiver != null) {
+            Context appContext = context.getApplicationContext();
+            if (appContext == null) {
+                appContext = context;
+            }
+            try {
+                appContext.unregisterReceiver(sDynamicReceiver);
+            } catch (IllegalArgumentException ignored) {}
+            sDynamicReceiver = null;
+        }
+    }
+
+    public static void evaluateImmediate(Context context) {
+        evaluateAndCheckConnected(context, true);
+    }
+
+    public static boolean evaluateAndCheckConnected(Context context, boolean forceWrite) {
+        Context appContext = context.getApplicationContext();
+        if (appContext == null) {
+            appContext = context;
+        }
+        Intent sticky = appContext.registerReceiver(null, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+        if (sticky != null) {
+            return processBatteryIntent(appContext, sticky, forceWrite);
+        } else {
+            handlePhysicalDisconnect(appContext);
+            return false;
+        }
+    }
+
+    private static void handlePhysicalDisconnect(Context context) {
+        SysfsController.forceSetChargingEnabled(true);
+        unregisterDynamicReceiver(context);
+        ChargeTriggerJobService.scheduleChargingWakeup(context);
+        ChargeMonitorService.notifyCableDisconnected(context);
+    }
+
+    @Override
+    public void onReceive(Context context, Intent intent) {
+        if (context == null || intent == null) {
+            return;
+        }
+        String action = intent.getAction();
+        if (Intent.ACTION_BATTERY_CHANGED.equals(action)) {
+            processBatteryIntent(context, intent, false);
+        } else if (Intent.ACTION_BOOT_COMPLETED.equals(action)
+                || Intent.ACTION_LOCKED_BOOT_COMPLETED.equals(action)
+                || Intent.ACTION_POWER_CONNECTED.equals(action)
+                || Intent.ACTION_POWER_DISCONNECTED.equals(action)) {
+            evaluateImmediate(context);
+        }
+    }
+
+    private static boolean processBatteryIntent(Context context, Intent batteryIntent, boolean forceWrite) {
+        SharedPreferences prefs = getPrefs(context);
+        boolean limiterEnabled = prefs.getBoolean(KEY_ENABLED, false);
+        int limit = prefs.getInt(KEY_LIMIT, DEFAULT_LIMIT);
+        if (limit < MIN_LIMIT) limit = MIN_LIMIT;
+        if (limit > MAX_LIMIT) limit = MAX_LIMIT;
+
+        int delta = prefs.getInt(KEY_DELTA, DEFAULT_DELTA);
+        if (delta < MIN_DELTA) delta = MIN_DELTA;
+        if (delta > MAX_DELTA) delta = MAX_DELTA;
+
+        int resumeThreshold = computeResumeThreshold(limit, delta);
+
+        int level = batteryIntent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1);
+        int scale = batteryIntent.getIntExtra(BatteryManager.EXTRA_SCALE, 100);
+        int status = batteryIntent.getIntExtra(BatteryManager.EXTRA_STATUS, BatteryManager.BATTERY_STATUS_UNKNOWN);
+        int pluggedInt = batteryIntent.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0);
+
+        if (level < 0 || scale <= 0) {
+            return false;
+        }
+
+        int pct = (level * 100) / scale;
+        boolean extraPlugged = pluggedInt != 0;
+        boolean cableConnected = SysfsController.isCablePhysicallyConnected(extraPlugged);
+
+        if (!cableConnected) {
+            StateListener listener = sListener;
+            if (listener != null) {
+                listener.onBatteryStateUpdated(pct, false, false, false);
+            }
+            handlePhysicalDisconnect(context);
+            return false;
+        }
+
+        registerDynamicReceiver(context);
+        ChargeMonitorService.notifyCableConnected(context);
+
+        if (!limiterEnabled) {
+            if (forceWrite || SysfsController.isChargingSuspended()) {
+                SysfsController.forceSetChargingEnabled(true);
+            }
+        } else {
+            if (pct >= limit) {
+                if (forceWrite) {
+                    SysfsController.forceSetChargingEnabled(false);
+                } else {
+                    SysfsController.setChargingEnabled(false);
+                }
+            } else if (pct <= resumeThreshold) {
+                if (forceWrite) {
+                    SysfsController.forceSetChargingEnabled(true);
+                } else {
+                    SysfsController.setChargingEnabled(true);
+                }
+            }
+        }
+
+        boolean suspended = SysfsController.isChargingSuspended();
+        boolean isCharging = (status == BatteryManager.BATTERY_STATUS_CHARGING) && !suspended;
+
+        StateListener listener = sListener;
+        if (listener != null) {
+            listener.onBatteryStateUpdated(pct, true, isCharging, suspended);
+        }
+        return true;
+    }
+}
+```
+
+### `MainActivity.java`
+
+```java
+package com.spes.chargelimiter;
+
+import android.app.Activity;
+import android.app.TimePickerDialog;
+import android.content.SharedPreferences;
+import android.graphics.Canvas;
+import android.graphics.Paint;
+import android.graphics.RectF;
+import android.graphics.Typeface;
+import android.graphics.drawable.ClipDrawable;
+import android.graphics.drawable.Drawable;
+import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.LayerDrawable;
+import android.os.Build;
+import android.os.Bundle;
+import android.util.DisplayMetrics;
+import android.util.TypedValue;
+import android.view.Gravity;
+import android.view.MotionEvent;
+import android.view.View;
+import android.view.ViewGroup;
+import android.view.Window;
+import android.view.WindowInsetsController;
+import android.widget.LinearLayout;
+import android.widget.ScrollView;
+import android.widget.SeekBar;
+import android.widget.TextView;
+import android.widget.TimePicker;
+
+import java.util.Locale;
+
+public final class MainActivity extends Activity implements ChargeReceiver.StateListener {
+
+    private static final int THEME_LIGHT = 0;
+    private static final int THEME_DARK = 1;
+    private static final int THEME_AMOLED = 2;
+
+    private static volatile boolean sUiVisible = false;
+
+    private SharedPreferences mPrefs;
+    private String mLang;
+    private int mTheme;
+    private boolean mEnabled;
+    private int mLimit;
+    private int mDelta;
+    private int mUnplugMode;
+    private int mKillHours;
+    private int mKillMinutes;
+
+    private int mLastLevel = -1;
+    private boolean mLastPlugged = false;
+    private boolean mLastCharging = false;
+    private boolean mLastSuspended = false;
+
+    private int mColorBg;
+    private int mColorSurface;
+    private int mColorBorder;
+    private int mColorTextPrimary;
+    private int mColorTextSecondary;
+    private int mColorAccent;
+    private int mColorOnAccent;
+    private int mColorTrackInactive;
+
+    private TextView mLevelValueText;
+    private TextView mStatusValueText;
+    private TextView mLimitValueText;
+    private TextView mDeltaValueText;
+    private TextView mSummaryHintText;
+    private TextView mTimerButtonText;
+    private FlatSwitchView mMasterSwitch;
+
+    public static boolean isUiVisible() {
+        return sUiVisible;
+    }
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        sUiVisible = true;
+        requestWindowFeature(Window.FEATURE_NO_TITLE);
+
+        mPrefs = ChargeReceiver.getPrefs(this);
+        initSettings();
+        resolveColors();
+        applyWindowStyling();
+        buildUserInterface();
+    }
+
+    @Override
+    protected void onStart() {
+        super.onStart();
+        sUiVisible = true;
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        sUiVisible = true;
+        ChargeReceiver.setStateListener(this);
+        ChargeReceiver.evaluateImmediate(this);
+    }
+
+    @Override
+    protected void onPause() {
+        ChargeReceiver.setStateListener(null);
+        super.onPause();
+    }
+
+    @Override
+    protected void onStop() {
+        super.onStop();
+        if (!isChangingConfigurations()) {
+            sUiVisible = false;
+            ChargeMonitorService.notifyPolicyChangedOrUiClosed(this, false);
+        }
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        if (!isChangingConfigurations()) {
+            sUiVisible = false;
+            ChargeMonitorService.notifyPolicyChangedOrUiClosed(this, false);
+        }
+    }
+
+    @Override
+    public void onBatteryStateUpdated(final int level, final boolean plugged, final boolean charging, final boolean suspended) {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                mLastLevel = level;
+                mLastPlugged = plugged;
+                mLastCharging = charging;
+                mLastSuspended = suspended;
+                updateStatusViews();
+            }
+        });
+    }
+
+    private void initSettings() {
+        if (!mPrefs.contains(ChargeReceiver.KEY_LANG)) {
+            String sysLang = Locale.getDefault().getLanguage();
+            String initialLang = "uk".equalsIgnoreCase(sysLang) ? "uk" : "en";
+            mPrefs.edit().putString(ChargeReceiver.KEY_LANG, initialLang).apply();
+        }
+        mLang = mPrefs.getString(ChargeReceiver.KEY_LANG, "en");
+        mTheme = mPrefs.getInt(ChargeReceiver.KEY_THEME, THEME_DARK);
+        mEnabled = mPrefs.getBoolean(ChargeReceiver.KEY_ENABLED, false);
+
+        mLimit = mPrefs.getInt(ChargeReceiver.KEY_LIMIT, ChargeReceiver.DEFAULT_LIMIT);
+        if (mLimit < ChargeReceiver.MIN_LIMIT) mLimit = ChargeReceiver.MIN_LIMIT;
+        if (mLimit > ChargeReceiver.MAX_LIMIT) mLimit = ChargeReceiver.MAX_LIMIT;
+
+        mDelta = mPrefs.getInt(ChargeReceiver.KEY_DELTA, ChargeReceiver.DEFAULT_DELTA);
+        if (mDelta < ChargeReceiver.MIN_DELTA) mDelta = ChargeReceiver.MIN_DELTA;
+        if (mDelta > ChargeReceiver.MAX_DELTA) mDelta = ChargeReceiver.MAX_DELTA;
+
+        mUnplugMode = mPrefs.getInt(ChargeReceiver.KEY_UNPLUG_MODE, ChargeReceiver.MODE_KILL_TIMER_ANY);
+        if (mUnplugMode < 0 || mUnplugMode > 3) {
+            mUnplugMode = ChargeReceiver.MODE_KILL_TIMER_ANY;
+        }
+
+        mKillHours = mPrefs.getInt(ChargeReceiver.KEY_KILL_HOURS, ChargeReceiver.DEFAULT_KILL_HOURS);
+        mKillMinutes = mPrefs.getInt(ChargeReceiver.KEY_KILL_MINUTES, ChargeReceiver.DEFAULT_KILL_MINUTES);
+        if (mKillHours < 0 || mKillHours > 23) mKillHours = 0;
+        if (mKillMinutes < 0 || mKillMinutes > 59) mKillMinutes = ChargeReceiver.DEFAULT_KILL_MINUTES;
+        if (mKillHours == 0 && mKillMinutes == 0) mKillMinutes = 1;
+    }
+
+    private void resolveColors() {
+        boolean hasMonet = Build.VERSION.SDK_INT >= 31;
+        if (mTheme == THEME_LIGHT) {
+            mColorBg = hasMonet ? getColor(android.R.color.system_neutral1_10) : 0xFFF8F9FA;
+            mColorSurface = hasMonet ? getColor(android.R.color.system_neutral1_50) : 0xFFFFFFFF;
+            mColorBorder = hasMonet ? getColor(android.R.color.system_neutral1_100) : 0xFFE2E5E9;
+            mColorTextPrimary = hasMonet ? getColor(android.R.color.system_neutral1_900) : 0xFF1A1C1E;
+            mColorTextSecondary = hasMonet ? getColor(android.R.color.system_neutral2_600) : 0xFF5F6368;
+            mColorAccent = hasMonet ? getColor(android.R.color.system_accent1_600) : 0xFF1B6EF3;
+            mColorOnAccent = 0xFFFFFFFF;
+            mColorTrackInactive = hasMonet ? getColor(android.R.color.system_neutral2_200) : 0xFFDADCE0;
+        } else if (mTheme == THEME_DARK) {
+            mColorBg = hasMonet ? getColor(android.R.color.system_neutral1_900) : 0xFF121316;
+            mColorSurface = hasMonet ? getColor(android.R.color.system_neutral1_800) : 0xFF1E2024;
+            mColorBorder = hasMonet ? getColor(android.R.color.system_neutral1_700) : 0xFF2D3036;
+            mColorTextPrimary = hasMonet ? getColor(android.R.color.system_neutral1_50) : 0xFFE3E3E6;
+            mColorTextSecondary = hasMonet ? getColor(android.R.color.system_neutral2_300) : 0xFF9AA0A6;
+            mColorAccent = hasMonet ? getColor(android.R.color.system_accent1_200) : 0xFFA8C7FA;
+            mColorOnAccent = hasMonet ? getColor(android.R.color.system_accent1_800) : 0xFF062E6F;
+            mColorTrackInactive = hasMonet ? getColor(android.R.color.system_neutral2_700) : 0xFF3C4043;
+        } else {
+            mColorBg = 0xFF000000;
+            mColorSurface = 0xFF0B0B0B;
+            mColorBorder = 0xFF1F1F1F;
+            mColorTextPrimary = 0xFFF2F2F2;
+            mColorTextSecondary = 0xFF9E9E9E;
+            mColorAccent = hasMonet ? getColor(android.R.color.system_accent1_200) : 0xFFA8C7FA;
+            mColorOnAccent = hasMonet ? getColor(android.R.color.system_accent1_800) : 0xFF062E6F;
+            mColorTrackInactive = 0xFF262626;
+        }
+    }
+
+    private void applyWindowStyling() {
+        Window window = getWindow();
+        window.setStatusBarColor(mColorBg);
+        window.setNavigationBarColor(mColorBg);
+        if (Build.VERSION.SDK_INT >= 30) {
+            WindowInsetsController controller = window.getInsetsController();
+            if (controller != null) {
+                int mask = WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS
+                        | WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS;
+                controller.setSystemBarsAppearance(mTheme == THEME_LIGHT ? mask : 0, mask);
+            }
+        }
+    }
+
+    private void buildUserInterface() {
+        ScrollView scroll = new ScrollView(this);
+        scroll.setBackgroundColor(mColorBg);
+        scroll.setFillViewport(true);
+        scroll.setVerticalScrollBarEnabled(false);
+
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        int padH = dp(20);
+        int padV = dp(24);
+        root.setPadding(padH, padV, padH, padV);
+
+        TextView titleView = new TextView(this);
+        titleView.setText(tr("title"));
+        titleView.setTextColor(mColorTextPrimary);
+        titleView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 26);
+        titleView.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        LinearLayout.LayoutParams titleLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        titleLp.bottomMargin = dp(20);
+        root.addView(titleView, titleLp);
+
+        // Card 1: Battery Status
+        LinearLayout statusCard = createCard();
+        LinearLayout statusRow = new LinearLayout(this);
+        statusRow.setOrientation(LinearLayout.HORIZONTAL);
+        statusRow.setGravity(Gravity.CENTER_VERTICAL);
+
+        LinearLayout levelCol = new LinearLayout(this);
+        levelCol.setOrientation(LinearLayout.VERTICAL);
+        TextView levelLabel = createSecondaryText(tr("current_level"), 13);
+        mLevelValueText = new TextView(this);
+        mLevelValueText.setTextColor(mColorAccent);
+        mLevelValueText.setTextSize(TypedValue.COMPLEX_UNIT_SP, 38);
+        mLevelValueText.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        levelCol.addView(levelLabel);
+        levelCol.addView(mLevelValueText);
+
+        LinearLayout stateCol = new LinearLayout(this);
+        stateCol.setOrientation(LinearLayout.VERTICAL);
+        stateCol.setGravity(Gravity.END);
+        TextView stateLabel = createSecondaryText(tr("status"), 13);
+        mStatusValueText = new TextView(this);
+        mStatusValueText.setTextColor(mColorTextPrimary);
+        mStatusValueText.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
+        mStatusValueText.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        LinearLayout.LayoutParams stateValLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        stateValLp.topMargin = dp(6);
+        stateCol.addView(stateLabel);
+        stateCol.addView(mStatusValueText, stateValLp);
+
+        statusRow.addView(levelCol, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        statusRow.addView(stateCol, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        statusCard.addView(statusRow);
+        root.addView(statusCard, createCardLayoutParams());
+
+        // Card 2: Enable / Disable Control
+        LinearLayout toggleCard = createCard();
+        LinearLayout toggleRow = new LinearLayout(this);
+        toggleRow.setOrientation(LinearLayout.HORIZONTAL);
+        toggleRow.setGravity(Gravity.CENTER_VERTICAL);
+
+        LinearLayout toggleTextCol = new LinearLayout(this);
+        toggleTextCol.setOrientation(LinearLayout.VERTICAL);
+        TextView toggleTitle = createPrimaryText(tr("enable_control"), 17);
+        TextView toggleSub = createSecondaryText(tr("enable_subtitle"), 13);
+        LinearLayout.LayoutParams subLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        subLp.topMargin = dp(3);
+        toggleTextCol.addView(toggleTitle);
+        toggleTextCol.addView(toggleSub, subLp);
+
+        mMasterSwitch = new FlatSwitchView(this);
+        mMasterSwitch.setChecked(mEnabled);
+        LinearLayout.LayoutParams switchLp = new LinearLayout.LayoutParams(dp(52), dp(30));
+        switchLp.leftMargin = dp(16);
+
+        toggleRow.addView(toggleTextCol, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        toggleRow.addView(mMasterSwitch, switchLp);
+        toggleCard.addView(toggleRow);
+
+        toggleCard.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                mEnabled = !mEnabled;
+                mMasterSwitch.setChecked(mEnabled);
+                mPrefs.edit().putBoolean(ChargeReceiver.KEY_ENABLED, mEnabled).apply();
+                ChargeReceiver.evaluateImmediate(MainActivity.this);
+                updateStatusViews();
+            }
+        });
+        root.addView(toggleCard, createCardLayoutParams());
+
+        // Card 3: Charge Limit & Resume Drop Sliders
+        LinearLayout limitCard = createCard();
+
+        LinearLayout limitHeader = new LinearLayout(this);
+        limitHeader.setOrientation(LinearLayout.HORIZONTAL);
+        limitHeader.setGravity(Gravity.CENTER_VERTICAL);
+
+        TextView limitTitle = createPrimaryText(tr("limit_label"), 17);
+        mLimitValueText = new TextView(this);
+        mLimitValueText.setTextColor(mColorAccent);
+        mLimitValueText.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
+        mLimitValueText.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        mLimitValueText.setText(mLimit + "%");
+
+        limitHeader.addView(limitTitle, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        limitHeader.addView(mLimitValueText, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        limitCard.addView(limitHeader);
+
+        SeekBar limitSeekBar = new SeekBar(this);
+        limitSeekBar.setMax(ChargeReceiver.MAX_LIMIT - ChargeReceiver.MIN_LIMIT);
+        limitSeekBar.setProgress(mLimit - ChargeReceiver.MIN_LIMIT);
+        limitSeekBar.setPadding(0, dp(14), 0, dp(16));
+        styleSeekBar(limitSeekBar);
+
+        limitSeekBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar bar, int progress, boolean fromUser) {
+                mLimit = ChargeReceiver.MIN_LIMIT + progress;
+                mLimitValueText.setText(mLimit + "%");
+                updateSummaryHint();
+            }
+
+            @Override
+            public void onStartTrackingTouch(SeekBar bar) {}
+
+            @Override
+            public void onStopTrackingTouch(SeekBar bar) {
+                mPrefs.edit().putInt(ChargeReceiver.KEY_LIMIT, mLimit).apply();
+                ChargeReceiver.evaluateImmediate(MainActivity.this);
+                updateStatusViews();
+            }
+        });
+        limitCard.addView(limitSeekBar, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        LinearLayout deltaHeader = new LinearLayout(this);
+        deltaHeader.setOrientation(LinearLayout.HORIZONTAL);
+        deltaHeader.setGravity(Gravity.CENTER_VERTICAL);
+
+        TextView deltaTitle = createPrimaryText(tr("delta_label"), 17);
+        mDeltaValueText = new TextView(this);
+        mDeltaValueText.setTextColor(mColorAccent);
+        mDeltaValueText.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
+        mDeltaValueText.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        mDeltaValueText.setText("-" + mDelta + "%");
+
+        deltaHeader.addView(deltaTitle, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        deltaHeader.addView(mDeltaValueText, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        limitCard.addView(deltaHeader);
+
+        SeekBar deltaSeekBar = new SeekBar(this);
+        deltaSeekBar.setMax(ChargeReceiver.MAX_DELTA - ChargeReceiver.MIN_DELTA);
+        deltaSeekBar.setProgress(mDelta - ChargeReceiver.MIN_DELTA);
+        deltaSeekBar.setPadding(0, dp(14), 0, dp(12));
+        styleSeekBar(deltaSeekBar);
+
+        deltaSeekBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar bar, int progress, boolean fromUser) {
+                mDelta = ChargeReceiver.MIN_DELTA + progress;
+                mDeltaValueText.setText("-" + mDelta + "%");
+                updateSummaryHint();
+            }
+
+            @Override
+            public void onStartTrackingTouch(SeekBar bar) {}
+
+            @Override
+            public void onStopTrackingTouch(SeekBar bar) {
+                mPrefs.edit().putInt(ChargeReceiver.KEY_DELTA, mDelta).apply();
+                ChargeReceiver.evaluateImmediate(MainActivity.this);
+                updateStatusViews();
+            }
+        });
+        limitCard.addView(deltaSeekBar, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        mSummaryHintText = createSecondaryText("", 13);
+        updateSummaryHint();
+        limitCard.addView(mSummaryHintText);
+        root.addView(limitCard, createCardLayoutParams());
+
+        // Card 4: Unplugged Behavior (4 Modes + System TimePickerDialog)
+        LinearLayout unplugCard = createCard();
+        TextView unplugTitle = createPrimaryText(tr("unplug_title"), 17);
+        LinearLayout.LayoutParams sectionTitleLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        sectionTitleLp.bottomMargin = dp(12);
+        unplugCard.addView(unplugTitle, sectionTitleLp);
+
+        String[] modeLabels = new String[] {
+            tr("mode_0"),
+            tr("mode_1"),
+            tr("mode_2"),
+            tr("mode_3")
+        };
+
+        for (int i = 0; i < modeLabels.length; i++) {
+            final int targetMode = i;
+            boolean selected = (mUnplugMode == targetMode);
+            TextView modeBtn = createVerticalOptionButton(modeLabels[i], selected);
+            modeBtn.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    if (mUnplugMode != targetMode) {
+                        mUnplugMode = targetMode;
+                        mPrefs.edit().putInt(ChargeReceiver.KEY_UNPLUG_MODE, mUnplugMode).apply();
+                        ChargeMonitorService.notifyPolicyChangedOrUiClosed(MainActivity.this, true);
+                        refreshUiInstant();
+                    }
+                }
+            });
+            LinearLayout.LayoutParams modeLp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            modeLp.bottomMargin = dp(8);
+            unplugCard.addView(modeBtn, modeLp);
+        }
+
+        mTimerButtonText = createTimerActionButton(formatTimerLabel());
+        mTimerButtonText.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                openSystemTimePicker();
+            }
+        });
+        LinearLayout.LayoutParams timerBtnLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(44));
+        timerBtnLp.topMargin = dp(4);
+        unplugCard.addView(mTimerButtonText, timerBtnLp);
+
+        root.addView(unplugCard, createCardLayoutParams());
+
+        // Card 5: Theme Selector
+        LinearLayout themeCard = createCard();
+        TextView themeTitle = createPrimaryText(tr("theme"), 17);
+        themeCard.addView(themeTitle, sectionTitleLp);
+
+        LinearLayout themeRow = new LinearLayout(this);
+        themeRow.setOrientation(LinearLayout.HORIZONTAL);
+        String[] themeLabels = new String[] { tr("theme_light"), tr("theme_dark"), tr("theme_amoled") };
+        for (int i = 0; i < themeLabels.length; i++) {
+            final int targetTheme = i;
+            boolean selected = (mTheme == targetTheme);
+            TextView pill = createSegmentButton(themeLabels[i], selected);
+            pill.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    if (mTheme != targetTheme) {
+                        mTheme = targetTheme;
+                        mPrefs.edit().putInt(ChargeReceiver.KEY_THEME, mTheme).apply();
+                        refreshUiInstant();
+                    }
+                }
+            });
+            LinearLayout.LayoutParams pillLp = new LinearLayout.LayoutParams(0, dp(40), 1f);
+            if (i > 0) pillLp.leftMargin = dp(8);
+            themeRow.addView(pill, pillLp);
+        }
+        themeCard.addView(themeRow);
+        root.addView(themeCard, createCardLayoutParams());
+
+        // Card 6: Language Selector
+        LinearLayout langCard = createCard();
+        TextView langTitle = createPrimaryText(tr("language"), 17);
+        langCard.addView(langTitle, sectionTitleLp);
+
+        LinearLayout langRow = new LinearLayout(this);
+        langRow.setOrientation(LinearLayout.HORIZONTAL);
+        final String[] langCodes = new String[] { "uk", "en" };
+        final String[] langNames = new String[] { "Українська", "English" };
+        for (int i = 0; i < langCodes.length; i++) {
+            final String code = langCodes[i];
+            boolean selected = code.equals(mLang);
+            TextView pill = createSegmentButton(langNames[i], selected);
+            pill.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    if (!code.equals(mLang)) {
+                        mLang = code;
+                        mPrefs.edit().putString(ChargeReceiver.KEY_LANG, mLang).apply();
+                        refreshUiInstant();
+                    }
+                }
+            });
+            LinearLayout.LayoutParams pillLp = new LinearLayout.LayoutParams(0, dp(40), 1f);
+            if (i > 0) pillLp.leftMargin = dp(8);
+            langRow.addView(pill, pillLp);
+        }
+        langCard.addView(langRow);
+        root.addView(langCard, createCardLayoutParams());
+
+        scroll.addView(root);
+        setContentView(scroll);
+        updateStatusViews();
+    }
+
+    private void openSystemTimePicker() {
+        TimePickerDialog dialog = new TimePickerDialog(
+                this,
+                new TimePickerDialog.OnTimeSetListener() {
+                    @Override
+                    public void onTimeSet(TimePicker view, int hourOfDay, int minute) {
+                        if (hourOfDay == 0 && minute == 0) {
+                            minute = 1;
+                        }
+                        mKillHours = hourOfDay;
+                        mKillMinutes = minute;
+                        mPrefs.edit()
+                                .putInt(ChargeReceiver.KEY_KILL_HOURS, mKillHours)
+                                .putInt(ChargeReceiver.KEY_KILL_MINUTES, mKillMinutes)
+                                .apply();
+                        if (mTimerButtonText != null) {
+                            mTimerButtonText.setText(formatTimerLabel());
+                        }
+                        ChargeMonitorService.notifyPolicyChangedOrUiClosed(MainActivity.this, true);
+                    }
+                },
+                mKillHours,
+                mKillMinutes,
+                true
+        );
+        dialog.show();
+    }
+
+    private String formatTimerLabel() {
+        if ("uk".equals(mLang)) {
+            return "Час до самоліквідації: " + mKillHours + " год " + mKillMinutes + " хв";
+        } else {
+            return "Self-kill timer: " + mKillHours + "h " + mKillMinutes + "m";
+        }
+    }
+
+    private void updateSummaryHint() {
+        if (mSummaryHintText == null) {
+            return;
+        }
+        int resumePct = ChargeReceiver.computeResumeThreshold(mLimit, mDelta);
+        if ("uk".equals(mLang)) {
+            mSummaryHintText.setText("Зупинка на " + mLimit + "% • Відновлення при падінні до " + resumePct + "%");
+        } else {
+            mSummaryHintText.setText("Stop at " + mLimit + "% • Resume when drops to " + resumePct + "%");
+        }
+    }
+
+    private void refreshUiInstant() {
+        resolveColors();
+        applyWindowStyling();
+        buildUserInterface();
+    }
+
+    private void updateStatusViews() {
+        if (mLevelValueText == null || mStatusValueText == null) {
+            return;
+        }
+        if (mLastLevel >= 0) {
+            mLevelValueText.setText(mLastLevel + "%");
+        } else {
+            mLevelValueText.setText("--%");
+        }
+
+        if (!SysfsController.isAvailable()) {
+            mStatusValueText.setText(tr("status_unavailable"));
+            return;
+        }
+
+        if (mLastSuspended) {
+            mStatusValueText.setText(tr("status_paused"));
+        } else if (mLastCharging) {
+            mStatusValueText.setText(tr("status_charging"));
+        } else if (mLastPlugged && mLastLevel == 100) {
+            mStatusValueText.setText(tr("status_full"));
+        } else {
+            mStatusValueText.setText(tr("status_discharging"));
+        }
+    }
+
+    private LinearLayout createCard() {
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        int pad = dp(18);
+        card.setPadding(pad, pad, pad, pad);
+
+        GradientDrawable bg = new GradientDrawable();
+        bg.setShape(GradientDrawable.RECTANGLE);
+        bg.setCornerRadius(dp(16));
+        bg.setColor(mColorSurface);
+        bg.setStroke(dp(1), mColorBorder);
+        card.setBackground(bg);
+        return card;
+    }
+
+    private LinearLayout.LayoutParams createCardLayoutParams() {
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.bottomMargin = dp(14);
+        return lp;
+    }
+
+    private TextView createPrimaryText(String text, int sp) {
+        TextView tv = new TextView(this);
+        tv.setText(text);
+        tv.setTextColor(mColorTextPrimary);
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, sp);
+        tv.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        return tv;
+    }
+
+    private TextView createSecondaryText(String text, int sp) {
+        TextView tv = new TextView(this);
+        tv.setText(text);
+        tv.setTextColor(mColorTextSecondary);
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, sp);
+        return tv;
+    }
+
+    private TextView createSegmentButton(String label, boolean selected) {
+        TextView tv = new TextView(this);
+        tv.setText(label);
+        tv.setGravity(Gravity.CENTER);
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        tv.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        tv.setTextColor(selected ? mColorOnAccent : mColorTextPrimary);
+
+        GradientDrawable bg = new GradientDrawable();
+        bg.setShape(GradientDrawable.RECTANGLE);
+        bg.setCornerRadius(dp(10));
+        if (selected) {
+            bg.setColor(mColorAccent);
+        } else {
+            bg.setColor(mColorBg);
+            bg.setStroke(dp(1), mColorBorder);
+        }
+        tv.setBackground(bg);
+        return tv;
+    }
+
+    private TextView createVerticalOptionButton(String label, boolean selected) {
+        TextView tv = new TextView(this);
+        tv.setText(label);
+        tv.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
+        int padH = dp(14);
+        int padV = dp(12);
+        tv.setPadding(padH, padV, padH, padV);
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        tv.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        tv.setTextColor(selected ? mColorOnAccent : mColorTextPrimary);
+
+        GradientDrawable bg = new GradientDrawable();
+        bg.setShape(GradientDrawable.RECTANGLE);
+        bg.setCornerRadius(dp(10));
+        if (selected) {
+            bg.setColor(mColorAccent);
+        } else {
+            bg.setColor(mColorBg);
+            bg.setStroke(dp(1), mColorBorder);
+        }
+        tv.setBackground(bg);
+        return tv;
+    }
+
+    private TextView createTimerActionButton(String label) {
+        TextView tv = new TextView(this);
+        tv.setText(label);
+        tv.setGravity(Gravity.CENTER);
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        tv.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        boolean timerRelevant = (mUnplugMode == ChargeReceiver.MODE_KILL_TIMER_ANY
+                || mUnplugMode == ChargeReceiver.MODE_KILL_SCREEN_OFF_TIMER);
+        tv.setTextColor(timerRelevant ? mColorAccent : mColorTextSecondary);
+
+        GradientDrawable bg = new GradientDrawable();
+        bg.setShape(GradientDrawable.RECTANGLE);
+        bg.setCornerRadius(dp(10));
+        bg.setColor(mColorBg);
+        bg.setStroke(dp(1), timerRelevant ? mColorAccent : mColorBorder);
+        tv.setBackground(bg);
+        return tv;
+    }
+
+    private void styleSeekBar(SeekBar seekBar) {
+        GradientDrawable trackBg = new GradientDrawable();
+        trackBg.setShape(GradientDrawable.RECTANGLE);
+        trackBg.setCornerRadius(dp(4));
+        trackBg.setColor(mColorTrackInactive);
+        trackBg.setSize(-1, dp(6));
+
+        GradientDrawable progressFill = new GradientDrawable();
+        progressFill.setShape(GradientDrawable.RECTANGLE);
+        progressFill.setCornerRadius(dp(4));
+        progressFill.setColor(mColorAccent);
+        progressFill.setSize(-1, dp(6));
+
+        ClipDrawable clipProgress = new ClipDrawable(progressFill, Gravity.START, ClipDrawable.HORIZONTAL);
+        LayerDrawable layers = new LayerDrawable(new Drawable[] { trackBg, clipProgress });
+        layers.setId(0, android.R.id.background);
+        layers.setId(1, android.R.id.progress);
+        seekBar.setProgressDrawable(layers);
+
+        GradientDrawable thumb = new GradientDrawable();
+        thumb.setShape(GradientDrawable.OVAL);
+        thumb.setSize(dp(20), dp(20));
+        thumb.setColor(mColorAccent);
+        seekBar.setThumb(thumb);
+        seekBar.setSplitTrack(false);
+    }
+
+    private int dp(int value) {
+        DisplayMetrics dm = getResources().getDisplayMetrics();
+        return (int) (value * dm.density + 0.5f);
+    }
+
+    private String tr(String key) {
+        boolean uk = "uk".equals(mLang);
+        switch (key) {
+            case "title":
+                return uk ? "Контроль заряду" : "Charge Control";
+            case "current_level":
+                return uk ? "Поточний заряд" : "Current Level";
+            case "status":
+                return uk ? "Стан" : "Status";
+            case "status_charging":
+                return uk ? "Заряджається" : "Charging";
+            case "status_paused":
+                return uk ? "Заряд зупинено" : "Charging paused";
+            case "status_discharging":
+                return uk ? "Від батареї" : "On battery";
+            case "status_full":
+                return uk ? "Заряджено" : "Charged";
+            case "status_unavailable":
+                return uk ? "Немає доступу" : "No access";
+            case "enable_control":
+                return uk ? "Обмеження заряду" : "Charge Limit";
+            case "enable_subtitle":
+                return uk ? "Автоматична зупинка при досягненні порогу" : "Automatically pause charging at target level";
+            case "limit_label":
+                return uk ? "Ліміт заряду" : "Target Limit";
+            case "delta_label":
+                return uk ? "Падіння для відновлення" : "Resume Drop";
+            case "unplug_title":
+                return uk ? "Режим після відключення шнура" : "Unplugged Behavior";
+            case "mode_0":
+                return uk ? "Самовбивство через час" : "Self-kill after timer";
+            case "mode_1":
+                return uk ? "Екран вимкнений + зняли струм: Через час" : "Screen off + unplugged: After timer";
+            case "mode_2":
+                return uk ? "Екран вимкнений + зняли струм: Одразу" : "Screen off + unplugged: Immediately";
+            case "mode_3":
+                return uk ? "Жити в фоні (мінімум процесів, тільки при шнурі)" : "Stay in background (idle, active only on cable)";
+            case "theme":
+                return uk ? "Тема" : "Theme";
+            case "theme_light":
+                return uk ? "Світла" : "Light";
+            case "theme_dark":
+                return uk ? "Темна" : "Dark";
+            case "theme_amoled":
+                return "AMOLED";
+            case "language":
+                return uk ? "Мова" : "Language";
+            default:
+                return key;
+        }
+    }
+
+    private final class FlatSwitchView extends View {
+        private final Paint mPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final RectF mRect = new RectF();
+        private boolean mChecked = false;
+
+        FlatSwitchView(Activity context) {
+            super(context);
+            setClickable(false);
+        }
+
+        void setChecked(boolean checked) {
+            if (mChecked != checked) {
+                mChecked = checked;
+                invalidate();
+            }
+        }
+
+        @Override
+        protected void onDraw(Canvas canvas) {
+            super.onDraw(canvas);
+            float w = getWidth();
+            float h = getHeight();
+            float radius = h / 2f;
+
+            mRect.set(0, 0, w, h);
+            mPaint.setStyle(Paint.Style.FILL);
+            mPaint.setColor(mChecked ? mColorAccent : mColorTrackInactive);
+            canvas.drawRoundRect(mRect, radius, radius, mPaint);
+
+            float pad = dp(4);
+            float thumbRadius = (h - pad * 2f) / 2f;
+            float cx = mChecked ? (w - pad - thumbRadius) : (pad + thumbRadius);
+            float cy = h / 2f;
+
+            mPaint.setColor(mChecked ? mColorOnAccent : mColorTextPrimary);
+            canvas.drawCircle(cx, cy, thumbRadius, mPaint);
+        }
+
+        @Override
+        public boolean onTouchEvent(MotionEvent event) {
+            return false;
+        }
+    }
+}
+```
+
+### `AndroidManifest.xml`
+
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.spes.chargelimiter"
+    android:versionCode="5"
+    android:versionName="1.4">
+
+    <uses-sdk
+        android:minSdkVersion="31"
+        android:targetSdkVersion="35" />
+
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <application
+        android:allowBackup="false"
+        android:directBootAware="true"
+        android:hasCode="true"
+        android:label="Charge Control">
+
+        <activity
+            android:name=".MainActivity"
+            android:configChanges="orientation|screenSize|keyboardHidden|uiMode|locale"
+            android:directBootAware="true"
+            android:exported="true"
+            android:launchMode="singleTask">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <receiver
+            android:name=".ChargeReceiver"
+            android:directBootAware="true"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+                <action android:name="android.intent.action.POWER_CONNECTED" />
+                <action android:name="android.intent.action.POWER_DISCONNECTED" />
+            </intent-filter>
+        </receiver>
+
+        <service
+            android:name=".ChargeMonitorService"
+            android:directBootAware="true"
+            android:enabled="true"
+            android:exported="false" />
+
+        <service
+            android:name=".ChargeTriggerJobService"
+            android:directBootAware="true"
+            android:exported="true"
+            android:permission="android.permission.BIND_JOB_SERVICE" />
+
+    </application>
+</manifest>
+```
+
+### `privapp-permissions-charge.xml`
+
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<permissions>
+    <privapp-permission package="com.spes.chargelimiter">
+        <permission name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    </privapp-permission>
+    <allow-in-power-save package="com.spes.chargelimiter" />
+    <allow-in-data-usage-save package="com.spes.chargelimiter" />
+</permissions>
+```
+
+### `init.spes_charge.rc`
+
+```rc
+on boot
+    chown system system /sys/class/power_supply/battery/input_suspend
+    chmod 0666 /sys/class/power_supply/battery/input_suspend
+
+    chown system system /sys/class/qcom-battery/input_suspend
+    chmod 0666 /sys/class/qcom-battery/input_suspend
+
+    chown system system /sys/class/power_supply/battery/charging_enabled
+    chmod 0666 /sys/class/power_supply/battery/charging_enabled
+
+    chown system system /sys/class/power_supply/battery/batt_slate_mode
+    chmod 0666 /sys/class/power_supply/battery/batt_slate_mode
+
+    chown system system /sys/class/power_supply/usb/input_suspend
+    chmod 0666 /sys/class/power_supply/usb/input_suspend
+
+    chown system system /sys/class/power_supply/battery/battery_charging_enabled
+    chmod 0666 /sys/class/power_supply/battery/battery_charging_enabled
+
+    chown system system /sys/class/power_supply/battery/charge_disable
+    chmod 0666 /sys/class/power_supply/battery/charge_disable
+
+    chown system system /sys/class/power_supply/battery/stop_charging
+    chmod 0666 /sys/class/power_supply/battery/stop_charging
+
+    chown system system /sys/class/power_supply/battery/store_mode
+    chmod 0666 /sys/class/power_supply/battery/store_mode
+
+    chown system system /sys/class/power_supply/main/input_suspend
+    chmod 0666 /sys/class/power_supply/main/input_suspend
+
+    chown system system /sys/class/power_supply/usb/present
+    chmod 0666 /sys/class/power_supply/usb/present
+
+    chown system system /sys/class/power_supply/usb/online
+    chmod 0666 /sys/class/power_supply/usb/online
+
+    chown system system /sys/class/power_supply/usb/typec_mode
+    chmod 0666 /sys/class/power_supply/usb/typec_mode
+
+    chown system system /sys/class/power_supply/battery/status
+    chmod 0666 /sys/class/power_supply/battery/status
+
+on property:sys.boot_completed=1
+    chown system system /sys/class/power_supply/battery/input_suspend
+    chmod 0666 /sys/class/power_supply/battery/input_suspend
+
+    chown system system /sys/class/qcom-battery/input_suspend
+    chmod 0666 /sys/class/qcom-battery/input_suspend
+
+    chown system system /sys/class/power_supply/battery/charging_enabled
+    chmod 0666 /sys/class/power_supply/battery/charging_enabled
+
+    chown system system /sys/class/power_supply/battery/batt_slate_mode
+    chmod 0666 /sys/class/power_supply/battery/batt_slate_mode
+
+    chown system system /sys/class/power_supply/usb/input_suspend
+    chmod 0666 /sys/class/power_supply/usb/input_suspend
+
+    chown system system /sys/class/power_supply/battery/battery_charging_enabled
+    chmod 0666 /sys/class/power_supply/battery/battery_charging_enabled
+
+    chown system system /sys/class/power_supply/battery/charge_disable
+    chmod 0666 /sys/class/power_supply/battery/charge_disable
+
+    chown system system /sys/class/power_supply/battery/stop_charging
+    chmod 0666 /sys/class/power_supply/battery/stop_charging
+
+    chown system system /sys/class/power_supply/battery/store_mode
+    chmod 0666 /sys/class/power_supply/battery/store_mode
+
+    chown system system /sys/class/power_supply/main/input_suspend
+    chmod 0666 /sys/class/power_supply/main/input_suspend
+
+    chown system system /sys/class/power_supply/usb/present
+    chmod 0666 /sys/class/power_supply/usb/present
+
+    chown system system /sys/class/power_supply/usb/online
+    chmod 0666 /sys/class/power_supply/usb/online
+
+    chown system system /sys/class/power_supply/usb/typec_mode
+    chmod 0666 /sys/class/power_supply/usb/typec_mode
+
+    chown system system /sys/class/power_supply/battery/status
+    chmod 0666 /sys/class/power_supply/battery/status
+```
+
+### `update-binary`
+
+```sh
+#!/sbin/sh
+# META-INF/com/google/android/update-binary
+
+OUTFD=$2
+ZIPFILE=$3
+
+ui_print() {
+    echo "ui_print $1" > /proc/self/fd/$OUTFD
+    echo "ui_print" > /proc/self/fd/$OUTFD
+}
+
+abort() {
+    ui_print "$1"
+    exit 1
+}
+
+ui_print "------------------------------------------"
+ui_print " ChargeLimiter System Installer (SM6225)  "
+ui_print " Target: Xiaomi Redmi Note 11 (spes/spesn)"
+ui_print "------------------------------------------"
+
+SLOT=$(getprop ro.boot.slot_suffix 2>/dev/null)
+
+for MAPPER in /dev/block/mapper/system /dev/block/mapper/system_a /dev/block/mapper/system_b /dev/block/mapper/system$SLOT; do
+    if [ -e "$MAPPER" ]; then
+        blockdev --setrw "$MAPPER" 2>/dev/null
+    fi
+done
+
+mount /system_root 2>/dev/null
+mount /system 2>/dev/null
+
+mount -o rw,remount /system_root 2>/dev/null
+mount -o rw,remount /system 2>/dev/null
+mount -o rw,remount / 2>/dev/null
+
+SYS_PATH=""
+if [ -d "/system_root/system/priv-app" ]; then
+    SYS_PATH="/system_root/system"
+elif [ -d "/system/system/priv-app" ]; then
+    SYS_PATH="/system/system"
+elif [ -d "/system/priv-app" ]; then
+    SYS_PATH="/system"
+else
+    for DEV in "/dev/block/mapper/system$SLOT" "/dev/block/mapper/system" "/dev/block/by-name/system$SLOT" "/dev/block/by-name/system"; do
+        if [ -e "$DEV" ]; then
+            mkdir -p /mnt/sys_tmp
+            mount -t ext4 -o rw "$DEV" /mnt/sys_tmp 2>/dev/null
+            if [ -d "/mnt/sys_tmp/system/priv-app" ]; then
+                SYS_PATH="/mnt/sys_tmp/system"
+                break
+            elif [ -d "/mnt/sys_tmp/priv-app" ]; then
+                SYS_PATH="/mnt/sys_tmp"
+                break
+            fi
+        fi
+    done
+fi
+
+[ -z "$SYS_PATH" ] && abort "! Failed to locate writable /system partition"
+
+ui_print "- Mounted system at: $SYS_PATH"
+
+TMP_DIR="/tmp/chargelimiter_install"
+rm -rf "$TMP_DIR"
+mkdir -p "$TMP_DIR"
+
+unzip -o "$ZIPFILE" -d "$TMP_DIR" >/dev/null 2>&1 || abort "! Failed to extract package"
+
+APP_DIR="$SYS_PATH/priv-app/ChargeLimiter"
+PERM_DIR="$SYS_PATH/etc/permissions"
+INIT_DIR="$SYS_PATH/etc/init"
+
+ui_print "- Installing system files..."
+mkdir -p "$APP_DIR"
+mkdir -p "$PERM_DIR"
+mkdir -p "$INIT_DIR"
+
+cp -f "$TMP_DIR/ChargeLimiter.apk" "$APP_DIR/ChargeLimiter.apk" || abort "! Missing ChargeLimiter.apk"
+cp -f "$TMP_DIR/privapp-permissions-charge.xml" "$PERM_DIR/privapp-permissions-charge.xml" || abort "! Missing privapp-permissions-charge.xml"
+cp -f "$TMP_DIR/init.spes_charge.rc" "$INIT_DIR/init.spes_charge.rc" || abort "! Missing init.spes_charge.rc"
+
+ui_print "- Setting permissions and SELinux contexts..."
+chown 0:0 "$APP_DIR"
+chmod 0755 "$APP_DIR"
+
+chown 0:0 "$APP_DIR/ChargeLimiter.apk"
+chmod 0644 "$APP_DIR/ChargeLimiter.apk"
+
+chown 0:0 "$PERM_DIR/privapp-permissions-charge.xml"
+chmod 0644 "$PERM_DIR/privapp-permissions-charge.xml"
+
+chown 0:0 "$INIT_DIR/init.spes_charge.rc"
+chmod 0644 "$INIT_DIR/init.spes_charge.rc"
+
+chcon -R u:object_r:system_file:s0 "$APP_DIR" 2>/dev/null
+chcon u:object_r:system_file:s0 "$PERM_DIR/privapp-permissions-charge.xml" 2>/dev/null
+chcon u:object_r:system_file:s0 "$INIT_DIR/init.spes_charge.rc" 2>/dev/null
+
+rm -rf "$TMP_DIR"
+sync
+
+umount /mnt/sys_tmp 2>/dev/null
+mount -o ro,remount /system_root 2>/dev/null
+mount -o ro,remount /system 2>/dev/null
+
+ui_print "- Installation complete."
+exit 0
+```
